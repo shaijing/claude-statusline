@@ -1,0 +1,2 @@
+test1:
+    echo '{"model":{"display_name":"Opus 4.6"},"workspace":{"current_dir":"/tmp/myproject"},"context_window":{"used_percentage":27,"context_window_size":200000,"current_usage":{"input_tokens":1200,"output_tokens":340}},"cost":{"total_cost_usd":1.40,"total_lines_added":5,"total_lines_removed":2},"session":{"turns":3,"total_turns":35,"duration_ms":589000,"thinking_effort":"high"}}' | ./target/release/claude-statusline
