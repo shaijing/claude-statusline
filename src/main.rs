@@ -30,8 +30,8 @@ fn col(s: &str, (r, g, b): (u8, u8, u8)) -> String {
     format!("{}", s.truecolor(r, g, b))
 }
 
-fn col_bold(s: &str, (r, g, b): (u8, u8, u8)) -> String {
-    format!("{}", s.truecolor(r, g, b).bold())
+fn col_bold<S: AsRef<str>>(s: S, (r, g, b): (u8, u8, u8)) -> String {
+    format!("{}", s.as_ref().truecolor(r, g, b).bold())
 }
 
 fn sep() -> String {
@@ -57,69 +57,146 @@ fn make_bar(used_pct: u32, width: usize) -> String {
     let (br, bg, bb) = palette::BAR_BG;
     let (dr, dg, db) = palette::DIM;
 
-    let filled_str: String = (0..filled)
-        .map(|_| {
-            format!(
-                "{}",
-                "█".truecolor(fg.0, fg.1, fg.2).on_truecolor(br, bg, bb)
-            )
-        })
-        .collect();
+    // 1. 先拼接纯文本字符串
+    let filled_chars = "█".repeat(filled);
+    let empty_chars = "░".repeat(empty);
 
-    let empty_str: String = (0..empty)
-        .map(|_| format!("{}", "░".truecolor(dr, dg, db).on_truecolor(br, bg, bb)))
-        .collect();
+    // 2. 对整个块进行一次性上色
+    let filled_str = filled_chars
+        .truecolor(fg.0, fg.1, fg.2)
+        .on_truecolor(br, bg, bb)
+        .to_string();
+
+    let empty_str = empty_chars
+        .truecolor(dr, dg, db)
+        .on_truecolor(br, bg, bb)
+        .to_string();
 
     format!("{filled_str}{empty_str}")
 }
+// fn make_bar(used_pct: u32, width: usize) -> String {
+//     let filled = ((used_pct as usize) * width) / 100;
+//     let empty = width - filled;
+
+//     let fg = if used_pct < 50 {
+//         palette::BAR_GREEN
+//     } else if used_pct < 75 {
+//         palette::BAR_YELLOW
+//     } else {
+//         palette::BAR_RED
+//     };
+
+//     let (br, bg, bb) = palette::BAR_BG;
+//     let (dr, dg, db) = palette::DIM;
+
+//     let filled_str: String = (0..filled)
+//         .map(|_| {
+//             format!(
+//                 "{}",
+//                 "█".truecolor(fg.0, fg.1, fg.2).on_truecolor(br, bg, bb)
+//             )
+//         })
+//         .collect();
+
+//     let empty_str: String = (0..empty)
+//         .map(|_| format!("{}", "░".truecolor(dr, dg, db).on_truecolor(br, bg, bb)))
+//         .collect();
+
+//     format!("{filled_str}{empty_str}")
+// }
 
 // ─── Claude Code stdin JSON ───────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Default)]
 struct ClaudeInput {
-    model: Option<ModelInfo>,
-    workspace: Option<Workspace>,
-    context_window: Option<ContextWindow>,
-    cost: Option<Cost>,
-    session: Option<Session>,
+    cwd: String,
+    session_id: String,
+    transcript_path: String,
+    model: ModelInfo,
+    workspace: Workspace,
+    version: String,
+    output_style: OutputStyle,
+    cost: Cost,
+    context_window: ContextWindow,
+    // session: Option<Session>,
+    exceeds_200k_tokens: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vim: Option<Vim>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<Agent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worktree: Option<Worktree>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct ModelInfo {
-    display_name: Option<String>,
+    id: String,
+    display_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct Workspace {
-    current_dir: Option<String>,
+    current_dir: String,
+    project_dir: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+struct OutputStyle {
+    name: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct ContextWindow {
-    used_percentage: Option<f64>,
-    context_window_size: Option<u64>,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    context_window_size: u64,
+    used_percentage: Option<u32>,
+    remaining_percentage: Option<u32>,
     current_usage: Option<CurrentUsage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct CurrentUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct Cost {
-    total_cost_usd: Option<f64>,
-    total_lines_added: Option<i64>,
-    total_lines_removed: Option<i64>,
+    total_cost_usd: f64,
+    total_duration_ms: u64,
+    total_api_duration_ms: u64,
+    total_lines_added: i64,
+    total_lines_removed: i64,
+}
+
+// #[derive(Debug, Deserialize)]
+// struct Session {
+//     turns: Option<u32>,
+//     total_turns: Option<u32>,
+//     duration_ms: Option<u64>,
+//     thinking_effort: Option<String>,
+// }
+
+#[derive(Debug, Deserialize)]
+struct Vim {
+    mode: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct Session {
-    turns: Option<u32>,
-    total_turns: Option<u32>,
-    duration_ms: Option<u64>,
-    thinking_effort: Option<String>,
+struct Agent {
+    name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Worktree {
+    pub name: String,
+    pub path: String,
+    pub branch: String,
+    pub original_cwd: String,
+    pub original_branch: String,
 }
 
 // ─── Usage API / Cache ────────────────────────────────────────────────────────
@@ -396,72 +473,30 @@ fn main() {
     let s = sep();
 
     // ── Extract ─────────────────────────────────────────────────────────────
-    let cwd = input
-        .workspace
-        .as_ref()
-        .and_then(|w| w.current_dir.as_deref())
-        .unwrap_or("");
+    let cwd = &input.workspace.current_dir;
 
-    let model_name = input
-        .model
-        .as_ref()
-        .and_then(|m| m.display_name.as_deref())
-        .unwrap_or("Claude");
+    let model_name = input.model.display_name;
 
-    let ctx_used_pct = input
-        .context_window
-        .as_ref()
-        .and_then(|c| c.used_percentage)
-        .unwrap_or(0.0) as u32;
+    let ctx_used_pct = input.context_window.used_percentage.unwrap_or(0);
 
-    let ctx_size_k = input
-        .context_window
-        .as_ref()
-        .and_then(|c| c.context_window_size)
-        .map(|n| n / 1000)
-        .unwrap_or(200);
+    let ctx_size_k = input.context_window.context_window_size / 1000;
 
-    let total_cost = input
-        .cost
-        .as_ref()
-        .and_then(|c| c.total_cost_usd)
-        .unwrap_or(0.0);
+    let total_cost = input.cost.total_cost_usd;
 
-    let (lines_added, lines_removed) = input
-        .cost
-        .as_ref()
-        .map(|c| {
-            (
-                c.total_lines_added.unwrap_or(0),
-                c.total_lines_removed.unwrap_or(0),
-            )
-        })
-        .unwrap_or((0, 0));
+    let (lines_added, lines_removed) =
+        (input.cost.total_lines_added, input.cost.total_lines_removed);
 
-    let duration_ms = input
-        .session
-        .as_ref()
-        .and_then(|s| s.duration_ms)
-        .unwrap_or(0);
-
-    let turns = input.session.as_ref().and_then(|s| s.turns);
-    let total_turns = input.session.as_ref().and_then(|s| s.total_turns);
-
-    let thinking_effort = input
-        .session
-        .as_ref()
-        .and_then(|s| s.thinking_effort.as_deref())
-        .unwrap_or("");
+    let duration_ms = input.cost.total_duration_ms;
 
     let in_tokens = input
         .context_window
+        .current_usage
         .as_ref()
-        .and_then(|c| c.current_usage.as_ref())
         .and_then(|u| u.input_tokens);
     let out_tokens = input
         .context_window
+        .current_usage
         .as_ref()
-        .and_then(|c| c.current_usage.as_ref())
         .and_then(|u| u.output_tokens);
 
     let mut rows: Vec<String> = Vec::new();
@@ -477,20 +512,6 @@ fn main() {
             "{bar} {}",
             col(&format!("{ctx_used_pct}%/{ctx_size_k}k"), palette::WHITE)
         ));
-
-        let cost_part = col_bold(&format!("${total_cost:.2}"), palette::YELLOW);
-        let turn_cost = match (turns, total_turns) {
-            (Some(t), Some(tt)) => format!(
-                "{} {cost_part}",
-                col_bold(&format!("#{t}/{tt}"), palette::YELLOW)
-            ),
-            (Some(t), None) => format!(
-                "{} {cost_part}",
-                col_bold(&format!("#{t}"), palette::YELLOW)
-            ),
-            _ => cost_part,
-        };
-        parts.push(turn_cost);
 
         rows.push(parts.join(&s));
     }
@@ -600,16 +621,6 @@ fn main() {
             rows.push(parts.join(&s));
         }
     }
-
-    // ── Row 4: thinking effort hint ───────────────────────────────────────────
-    // if !thinking_effort.is_empty() && thinking_effort != "auto" {
-    //     let msg = match thinking_effort {
-    //         "high" | "ultrathink" => col("Effort set to high for this turn", palette::YELLOW),
-    //         "low" | "think" => col("Effort set to low for this turn", palette::GRAY),
-    //         other => col(&format!("Effort: {other}"), palette::GRAY),
-    //     };
-    //     rows.push(msg);
-    // }
 
     println!("{}", rows.join("\n"));
 }
