@@ -23,22 +23,25 @@ echo '{
   "model": {"display_name": "Opus 4.6"},
   "workspace": {"current_dir": "/Users/me/project"},
   "context_window": {"used_percentage": 27, "context_window_size": 200000},
-  "cost": {"total_cost_usd": 1.40},
-  "session": {"turns": 3, "total_turns": 35, "duration_ms": 589000}
+  "cost": {"total_cost_usd": 1.40, "total_duration_ms": 589000}
 }' | cargo run --release
 ```
+
+Enable debug logging with `STATUSLINE_DEBUG=1` to write to `~/.claude/statusline_debug.log`.
 
 ## Architecture
 
 Single-file application (`src/main.rs`) with these components:
 
-1. **Input parsing** - `ClaudeInput` struct deserializes JSON from stdin containing model, workspace, context window, cost, and session data
+1. **Block system** - Each display element implements the `Block` trait. A `Block` renders to `Option<String>` (None = skip). Blocks are composed into `Row`s, rows into `Layout`. See comments at `src/main.rs:779-785` for how to add/reorder/remove blocks.
 
-2. **OAuth token resolution** - Falls through: env var `CLAUDE_CODE_OAUTH_TOKEN` → macOS Keychain → Linux `~/.claude/.credentials.json` → GNOME Keyring via `secret-tool`
+2. **Input parsing** - `ClaudeInput` struct deserializes JSON from stdin. Derived context (dir name, git branch, diff stats) is computed once in `DerivedCtx::build()` and shared across blocks.
 
-3. **Usage API** - Fetches from `https://api.anthropic.com/api/oauth/usage` with 5-minute cache in `~/.claude/statusline_cache.json`
+3. **OAuth token resolution** - Falls through: env var `CLAUDE_CODE_OAUTH_TOKEN` → macOS Keychain → Linux `~/.claude/.credentials.json` → GNOME Keyring via `secret-tool`
 
-4. **Output rendering** - 3 lines of formatted, colored status using Catppuccin Mocha palette via `owo-colors`
+4. **Usage API** - Fetches from `https://api.anthropic.com/api/oauth/usage` with 5-minute cache. Uses background refresh: current invocation renders with cached data, next invocation gets fresh data.
+
+5. **Output rendering** - 3 rows of formatted status using Catppuccin Mocha palette via `owo-colors`
 
 ## Key Dependencies
 

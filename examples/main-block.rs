@@ -32,6 +32,10 @@ fn col_bold(s: &str, (r, g, b): (u8, u8, u8)) -> String {
     format!("{}", s.truecolor(r, g, b).bold())
 }
 
+fn dim_sep() -> String {
+    col(" │ ", palette::DIM)
+}
+
 // ─── Progress bar ─────────────────────────────────────────────────────────────
 
 fn make_bar(used_pct: u32, width: usize) -> String {
@@ -64,177 +68,9 @@ fn make_bar(used_pct: u32, width: usize) -> String {
     format!("{filled_str}{empty_str}")
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-fn now_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn iso_to_epoch(s: &str) -> Option<u64> {
-    let trimmed = s.split('.').next().unwrap_or(s).trim_end_matches('Z');
-    format!("{trimmed}Z")
-        .parse::<DateTime<Utc>>()
-        .ok()
-        .map(|dt| dt.timestamp() as u64)
-}
-
-fn fmt_duration_ms(ms: u64) -> String {
-    let total = ms / 1000;
-    let m = total / 60;
-    let s = total % 60;
-    if m > 0 {
-        format!("{m}m{s:02}s")
-    } else {
-        format!("{s}s")
-    }
-}
-
-fn fmt_token(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.0}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-fn usage_color(pct: u32) -> (u8, u8, u8) {
-    if pct < 50 {
-        palette::GREEN
-    } else if pct < 75 {
-        palette::YELLOW
-    } else {
-        palette::RED
-    }
-}
-
-fn debug_log(msg: &str) {
-    if std::env::var("STATUSLINE_DEBUG").is_ok() {
-        if let Some(path) = dirs::home_dir().map(|h| h.join(".claude/statusline_debug.log")) {
-            let line = format!("[{}] {}\n", now_epoch(), msg);
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = f.write_all(line.as_bytes());
-            }
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Input structs
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[derive(Debug, Deserialize, Default)]
-struct ClaudeInput {
-    model: ModelInfo,
-    workspace: Workspace,
-    cost: Cost,
-    context_window: ContextWindow,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ModelInfo {
-    display_name: String,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct Workspace {
-    current_dir: String,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ContextWindow {
-    context_window_size: u64,
-    used_percentage: Option<u32>,
-    current_usage: Option<CurrentUsage>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct CurrentUsage {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct Cost {
-    total_cost_usd: f64,
-    total_duration_ms: u64,
-    total_lines_added: i64,
-    total_lines_removed: i64,
-}
-
-fn parse_input(buf: &str) -> ClaudeInput {
-    match serde_json::from_str(buf) {
-        Ok(v) => v,
-        Err(e) => {
-            debug_log(&format!("parse_input error: {e}\n---\n{buf}"));
-            ClaudeInput::default()
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Derived context  — computed once, shared across all blocks
-// ═══════════════════════════════════════════════════════════════════════════════
-
-struct DerivedCtx {
-    /// basename of workspace.current_dir
-    dir_name: String,
-    /// current git branch, if any
-    git_branch: Option<String>,
-    /// (lines_added, lines_removed) from cost struct or live git diff
-    git_diff: (i64, i64),
-}
-
-impl DerivedCtx {
-    fn build(input: &ClaudeInput) -> Self {
-        let cwd = &input.workspace.current_dir;
-
-        let dir_name = Path::new(cwd)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("~")
-            .to_owned();
-
-        let git_branch = git_branch(cwd);
-
-        // Prefer values already in the cost struct; only shell out if both are 0.
-        let git_diff = {
-            let la = input.cost.total_lines_added;
-            let lr = input.cost.total_lines_removed;
-            if la != 0 || lr != 0 {
-                (la, lr)
-            } else {
-                git_diff_stat(cwd)
-            }
-        };
-
-        DerivedCtx {
-            dir_name,
-            git_branch,
-            git_diff,
-        }
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Block system
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// Shared data passed to every block at render time.
-struct RenderCtx<'a> {
-    input: &'a ClaudeInput,
-    cache: &'a Cache,
-    derived: &'a DerivedCtx,
-}
 
 /// A Block renders itself into an optional string.
 /// Returning `None` means "nothing to show" — the block is skipped entirely.
@@ -242,73 +78,28 @@ trait Block {
     fn render(&self, ctx: &RenderCtx) -> Option<String>;
 }
 
-// ── Row ───────────────────────────────────────────────────────────────────────
-
-struct Row {
-    blocks: Vec<Box<dyn Block>>,
-    separator: String,
+/// Shared data passed to every block at render time.
+struct RenderCtx<'a> {
+    input: &'a ClaudeInput,
+    cache: &'a Cache,
 }
 
+/// A Row is an ordered list of blocks joined by `dim_sep()`.
+/// Empty blocks (those that return `None`) are automatically skipped.
+struct Row(Vec<Box<dyn Block>>);
+
 impl Row {
-    /// Standard row: blocks separated by a dim │
-    fn new(blocks: Vec<Box<dyn Block>>) -> Self {
-        Row {
-            blocks,
-            separator: col(" │ ", palette::DIM),
-        }
-    }
-
-    /// Row with a custom separator string.
-    fn with_sep(blocks: Vec<Box<dyn Block>>, separator: impl Into<String>) -> Self {
-        Row {
-            blocks,
-            separator: separator.into(),
-        }
-    }
-
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
-        let parts: Vec<String> = self.blocks.iter().filter_map(|b| b.render(ctx)).collect();
+        let parts: Vec<String> = self.0.iter().filter_map(|b| b.render(ctx)).collect();
         if parts.is_empty() {
             None
         } else {
-            Some(parts.join(&self.separator))
+            Some(parts.join(&dim_sep()))
         }
     }
 }
 
-// ── BlockGroup ────────────────────────────────────────────────────────────────
-
-/// A group where the first block acts as a guard: if it returns `None`,
-/// the entire group is suppressed (including the remaining members).
-/// Useful for "only show reset countdown when usage data exists".
-struct BlockGroup {
-    guard: Box<dyn Block>,
-    members: Vec<Box<dyn Block>>,
-    separator: String,
-}
-
-impl BlockGroup {
-    fn new(guard: Box<dyn Block>, members: Vec<Box<dyn Block>>) -> Self {
-        BlockGroup {
-            guard,
-            members,
-            separator: col(" │ ", palette::DIM),
-        }
-    }
-}
-
-impl Block for BlockGroup {
-    fn render(&self, ctx: &RenderCtx) -> Option<String> {
-        // Guard must produce output; if not, the whole group is suppressed.
-        let guard_out = self.guard.render(ctx)?;
-        let mut parts = vec![guard_out];
-        parts.extend(self.members.iter().filter_map(|b| b.render(ctx)));
-        Some(parts.join(&self.separator))
-    }
-}
-
-// ── Layout ────────────────────────────────────────────────────────────────────
-
+/// Top-level layout: an ordered list of rows, each printed on its own line.
 struct Layout(Vec<Row>);
 
 impl Layout {
@@ -334,22 +125,14 @@ impl Block for ModelBlock {
     }
 }
 
-/// Context window bar + percentage/size label.
-/// `width` controls the bar character count.
-struct ContextBarBlock {
-    width: usize,
-}
-impl Default for ContextBarBlock {
-    fn default() -> Self {
-        ContextBarBlock { width: 10 }
-    }
-}
+/// Context window bar + percentage/size label
+struct ContextBarBlock;
 impl Block for ContextBarBlock {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
         let cw = &ctx.input.context_window;
         let used_pct = cw.used_percentage.unwrap_or(0);
         let size_k = cw.context_window_size / 1000;
-        let bar = make_bar(used_pct, self.width);
+        let bar = make_bar(used_pct, 10);
         let label = col(&format!("{used_pct}%/{size_k}k"), palette::WHITE);
         Some(format!("{bar} {label}"))
     }
@@ -364,14 +147,13 @@ impl Block for CostBlock {
     }
 }
 
-/// 5-hour session usage percentage.
-/// Acts as the guard for `SessionGroup` — if this returns None, reset/spend
-/// blocks are suppressed too.
+/// 5-hour session usage percentage
 struct SessionUsageBlock;
 impl Block for SessionUsageBlock {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
         let pct = ctx.cache.session_pct?;
-        Some(col(&format!("~{pct}%"), usage_color(pct)))
+        let color = usage_color(pct);
+        Some(col(&format!("~{pct}%"), color))
     }
 }
 
@@ -406,23 +188,13 @@ impl Block for DailySpendBlock {
     }
 }
 
-/// Cost burn rate: "● $2.6/h".
-/// `min_session_ms` controls how long a session must run before the rate appears.
-struct BurnRateBlock {
-    min_session_ms: u64,
-}
-impl Default for BurnRateBlock {
-    fn default() -> Self {
-        BurnRateBlock {
-            min_session_ms: 3_600_000,
-        }
-    }
-}
+/// Cost burn rate: "● $2.6/h" (only shown after 1h of session time)
+struct BurnRateBlock;
 impl Block for BurnRateBlock {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
         let ms = ctx.input.cost.total_duration_ms;
         let cost = ctx.input.cost.total_cost_usd;
-        if ms < self.min_session_ms || cost == 0.0 {
+        if ms < 3_600_000 || cost == 0.0 {
             return None;
         }
         let rate = cost / (ms as f64 / 3_600_000.0);
@@ -483,11 +255,19 @@ impl Block for DurationBlock {
 }
 
 /// Git diff lines added/removed: "+5/-2"
-/// Data comes from DerivedCtx (computed once, not per-block).
+/// Prefers values from `cost` struct; falls back to live `git diff --numstat HEAD`.
 struct GitDiffBlock;
 impl Block for GitDiffBlock {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
-        let (add, del) = ctx.derived.git_diff;
+        let (add, del) = {
+            let la = ctx.input.cost.total_lines_added;
+            let lr = ctx.input.cost.total_lines_removed;
+            if la != 0 || lr != 0 {
+                (la, lr)
+            } else {
+                git_diff_stat(&ctx.input.workspace.current_dir)
+            }
+        };
         Some(format!(
             "{}/{}",
             col(&format!("+{add}"), palette::GREEN),
@@ -497,27 +277,106 @@ impl Block for GitDiffBlock {
 }
 
 /// Current directory basename + git branch: "myproject (main)"
-/// Data comes from DerivedCtx (computed once, not per-block).
 struct DirBlock;
 impl Block for DirBlock {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
-        let branch = ctx
-            .derived
-            .git_branch
-            .as_deref()
+        let cwd = &ctx.input.workspace.current_dir;
+        let dir = Path::new(cwd)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("~");
+        let branch = git_branch(cwd)
             .map(|b| format!(" {}", col(&format!("({b})"), palette::GRAY)))
             .unwrap_or_default();
-        Some(format!(
-            "{}{}",
-            col(&ctx.derived.dir_name, palette::WHITE),
-            branch
-        ))
+        Some(format!("{}{}", col(dir, palette::WHITE), branch))
+    }
+}
+
+struct VimModeBlock;
+impl Block for VimModeBlock {
+    fn render(&self, ctx: &RenderCtx) -> Option<String> {
+        let mode = ctx.input.vim.as_ref()?.mode.as_str();
+        Some(col(&format!("[{mode}]"), palette::CYAN))
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Usage API / Cache
+// Input structs
 // ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize, Default)]
+struct ClaudeInput {
+    cwd: String,
+    session_id: String,
+    transcript_path: String,
+    model: ModelInfo,
+    workspace: Workspace,
+    version: String,
+    output_style: OutputStyle,
+    cost: Cost,
+    context_window: ContextWindow,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vim: Option<Vim>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<Agent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worktree: Option<Worktree>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ModelInfo {
+    id: String,
+    display_name: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct Workspace {
+    current_dir: String,
+    project_dir: String,
+}
+#[derive(Debug, Deserialize, Default)]
+struct OutputStyle {
+    name: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ContextWindow {
+    context_window_size: u64,
+    used_percentage: Option<u32>,
+    current_usage: Option<CurrentUsage>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CurrentUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct Cost {
+    total_cost_usd: f64,
+    total_duration_ms: u64,
+    total_lines_added: i64,
+    total_lines_removed: i64,
+}
+#[derive(Debug, Deserialize)]
+struct Vim {
+    mode: String,
+}
+#[derive(Debug, Deserialize)]
+struct Agent {
+    name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Worktree {
+    pub name: String,
+    pub path: String,
+    pub branch: String,
+    pub original_cwd: String,
+    pub original_branch: String,
+}
+// ─── Usage API / Cache ────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct Cache {
@@ -549,33 +408,55 @@ struct ExtraUsage {
     monthly_limit: Option<f64>,
 }
 
-const CACHE_TTL: u64 = 300;
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn cache_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude/statusline_cache.json"))
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
-fn load_cache() -> Cache {
-    cache_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+fn iso_to_epoch(s: &str) -> Option<u64> {
+    let trimmed = s.split('.').next().unwrap_or(s).trim_end_matches('Z');
+    format!("{trimmed}Z")
+        .parse::<DateTime<Utc>>()
+        .ok()
+        .map(|dt| dt.timestamp() as u64)
 }
 
-fn save_cache(c: &Cache) {
-    if let Some(path) = cache_path() {
-        if let Ok(json) = serde_json::to_string(c) {
-            let _ = std::fs::write(path, json);
-        }
+fn fmt_duration_ms(ms: u64) -> String {
+    let total = ms / 1000;
+    let m = total / 60;
+    let s = total % 60;
+    if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
     }
 }
 
-fn cache_needs_refresh(cache: &Cache) -> bool {
-    let now = now_epoch();
-    cache.timestamp == 0 || now.saturating_sub(cache.timestamp) >= CACHE_TTL
+fn fmt_token(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
-// ─── OAuth token resolution ───────────────────────────────────────────────────
+fn usage_color(pct: u32) -> (u8, u8, u8) {
+    if pct < 50 {
+        palette::GREEN
+    } else if pct < 75 {
+        palette::YELLOW
+    } else {
+        palette::RED
+    }
+}
+
+// ─── OAuth + Usage API ────────────────────────────────────────────────────────
 
 fn get_oauth_token() -> Option<String> {
     if let Ok(t) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
@@ -634,54 +515,61 @@ fn get_oauth_token() -> Option<String> {
     None
 }
 
-// ─── Async cache refresh ──────────────────────────────────────────────────────
+const CACHE_TTL: u64 = 300;
 
-/// Fetch from the API and write to the cache file.
-/// Only ever called from a background thread.
-fn fetch_and_save_cache() {
-    let now = now_epoch();
+fn cache_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude/statusline_cache.json"))
+}
 
-    // Re-check inside the thread: another invocation may have refreshed already.
-    let mut cache = load_cache();
-    if !cache_needs_refresh(&cache) {
-        return;
+fn load_cache() -> Cache {
+    cache_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_cache(c: &Cache) {
+    if let Some(path) = cache_path() {
+        if let Ok(json) = serde_json::to_string(c) {
+            let _ = std::fs::write(path, json);
+        }
     }
+}
 
+fn fetch_usage() -> Cache {
+    let now = now_epoch();
+    let mut cache = load_cache();
+    if cache.timestamp > 0 && now.saturating_sub(cache.timestamp) < CACHE_TTL {
+        return cache;
+    }
     let token = match get_oauth_token() {
         Some(t) => t,
         None => {
-            debug_log("fetch_and_save_cache: no oauth token found");
             cache.timestamp = now;
             save_cache(&cache);
-            return;
+            return cache;
         }
     };
-
     let resp = ureq::get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", &format!("Bearer {token}"))
         .header("anthropic-beta", "oauth-2025-04-20")
         .call();
-
     let usage: UsageResponse = match resp {
         Ok(r) => match r.into_body().read_json() {
             Ok(u) => u,
-            Err(e) => {
-                debug_log(&format!("fetch_and_save_cache: json parse error: {e}"));
+            Err(_) => {
                 cache.timestamp = now;
                 save_cache(&cache);
-                return;
+                return cache;
             }
         },
-        Err(e) => {
-            debug_log(&format!("fetch_and_save_cache: http error: {e}"));
+        Err(_) => {
             cache.timestamp = now;
             save_cache(&cache);
-            return;
+            return cache;
         }
     };
-
     cache.timestamp = now;
-
     if let Some(fh) = &usage.five_hour {
         cache.session_pct = fh.utilization.map(|u| u as u32);
         cache.session_reset_secs = fh
@@ -702,15 +590,8 @@ fn fetch_and_save_cache() {
         cache.extra_used_cents = ex.used_credits;
         cache.extra_limit_cents = ex.monthly_limit;
     }
-
     save_cache(&cache);
-    debug_log("fetch_and_save_cache: done");
-}
-
-/// Kick off a background refresh. The JoinHandle is dropped (detached);
-/// the main thread never waits. The *next* invocation reads the fresh cache.
-fn refresh_cache_background() {
-    let _ = std::thread::spawn(fetch_and_save_cache);
+    cache
 }
 
 // ─── Git helpers ──────────────────────────────────────────────────────────────
@@ -750,63 +631,39 @@ fn git_diff_stat(cwd: &str) -> (i64, i64) {
         })
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Main
-// ═══════════════════════════════════════════════════════════════════════════════
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
     let mut buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut buf);
-    let input = parse_input(&buf);
-
-    // Load cache instantly (file read only). Stale → background refresh;
-    // this invocation renders with the old data, next one gets the fresh data.
-    let cache = load_cache();
-    if cache_needs_refresh(&cache) {
-        refresh_cache_background();
-    }
-
-    // Compute derived data once — shared across all blocks, no repeated git calls.
-    let derived = DerivedCtx::build(&input);
-
+    let input: ClaudeInput = serde_json::from_str(&buf).unwrap_or_default();
+    let cache = fetch_usage();
     let ctx = RenderCtx {
         input: &input,
         cache: &cache,
-        derived: &derived,
     };
 
-    // ── Layout ───────────────────────────────────────────────────────────────
-    //
-    // Adding a block:  implement Block, drop it into the row you want.
-    // Reordering:      move it within the vec.
-    // Removing:        delete the line.
-    // Custom separator: Row::with_sep(blocks, "  ") instead of Row::new(blocks).
-    // Conditional group: BlockGroup::new(guard, members) — members only render
-    //                    when guard returns Some.
-    //
+    // ── Layout definition ────────────────────────────────────────────────────
+    // To add a new block: implement Block, then drop it into the row you want.
+    // To reorder: move it within the vec. To remove: delete the line.
     let layout = Layout(vec![
-        // Row 1: model · context bar · cost
-        Row::new(vec![
+        Row(vec![
             Box::new(ModelBlock),
-            Box::new(ContextBarBlock::default()),
+            Box::new(ContextBarBlock),
             Box::new(CostBlock),
         ]),
-        // Row 2: session usage (guard) + reset/spend/rate as a group.
-        // If session data is absent the whole row is suppressed.
-        Row::new(vec![Box::new(BlockGroup::new(
+        Row(vec![
             Box::new(SessionUsageBlock),
-            vec![
-                Box::new(SessionResetBlock),
-                Box::new(DailySpendBlock),
-                Box::new(BurnRateBlock::default()),
-            ],
-        ))]),
-        // Row 3: extra credits · tokens · duration · git diff · dir
-        Row::new(vec![
+            Box::new(SessionResetBlock),
+            Box::new(DailySpendBlock),
+            Box::new(BurnRateBlock),
+        ]),
+        Row(vec![
             Box::new(ExtraCreditsBlock),
             Box::new(TokenCountBlock),
             Box::new(DurationBlock),
             Box::new(GitDiffBlock),
+            Box::new(VimModeBlock),
             Box::new(DirBlock),
         ]),
     ]);
