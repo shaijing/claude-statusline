@@ -1,4 +1,4 @@
-use chrono::{NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -6,6 +6,8 @@ use std::fmt::Write;
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 // ─── Catppuccin Mocha palette ─────────────────────────────────────────────────
 mod palette {
@@ -84,21 +86,13 @@ fn now_epoch() -> u64 {
 }
 
 fn iso_to_epoch(s: &str) -> Option<u64> {
-    // Handle ISO format with optional fractional seconds
-    let s = s.trim_end_matches('Z');
-    let s = if s.contains('.') {
-        // Truncate fractional seconds to 3 digits for chrono
-        let parts: Vec<&str> = s.split('.').collect();
-        if parts.len() == 2 {
-            let frac = parts[1].chars().take(3).collect::<String>();
-            format!("{}.{}Z", parts[0], frac)
-        } else {
-            format!("{}Z", s)
-        }
-    } else {
-        format!("{}Z", s)
-    };
-    NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.fZ")
+    // Try RFC3339 first (handles fractional seconds correctly)
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp() as u64);
+    }
+    // Fallback: handle non-standard formats without timezone
+    let trimmed = s.trim_end_matches('Z');
+    NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
         .ok()
         .map(|dt| dt.and_utc().timestamp() as u64)
 }
@@ -146,18 +140,26 @@ fn usage_color(pct: u32) -> (u8, u8, u8) {
     }
 }
 
+/// Cached debug mode check — only evaluates env var once.
+static DEBUG_MODE: OnceLock<bool> = OnceLock::new();
+
+fn is_debug() -> bool {
+    *DEBUG_MODE.get_or_init(|| std::env::var("STATUSLINE_DEBUG").is_ok())
+}
+
 fn debug_log(msg: &str) {
-    if std::env::var("STATUSLINE_DEBUG").is_ok() {
-        if let Some(path) = dirs::home_dir().map(|h| h.join(".claude/statusline_debug.log")) {
-            let line = format!("[{}] {}\n", now_epoch(), msg);
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = f.write_all(line.as_bytes());
-            }
+    if !is_debug() {
+        return;
+    }
+    if let Some(path) = dirs::home_dir().map(|h| h.join(".claude/statusline_debug.log")) {
+        let line = format!("[{}] {}\n", now_epoch(), msg);
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = f.write_all(line.as_bytes());
         }
     }
 }
@@ -278,18 +280,21 @@ trait Block {
 
 // ── Row ───────────────────────────────────────────────────────────────────────
 
+/// Cached separator string (dim │).
+static SEPARATOR: OnceLock<String> = OnceLock::new();
+
+fn get_separator() -> &'static str {
+    SEPARATOR.get_or_init(|| col(" │ ", palette::DIM))
+}
+
 struct Row {
     blocks: Vec<Box<dyn Block>>,
-    separator: String,
 }
 
 impl Row {
     /// Standard row: blocks separated by a dim │
     fn new(blocks: Vec<Box<dyn Block>>) -> Self {
-        Row {
-            blocks,
-            separator: col(" │ ", palette::DIM),
-        }
+        Row { blocks }
     }
 
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
@@ -297,7 +302,7 @@ impl Row {
         if parts.is_empty() {
             None
         } else {
-            Some(parts.join(&self.separator))
+            Some(parts.join(get_separator()))
         }
     }
 }
@@ -310,16 +315,11 @@ impl Row {
 struct BlockGroup {
     guard: Box<dyn Block>,
     members: Vec<Box<dyn Block>>,
-    separator: String,
 }
 
 impl BlockGroup {
     fn new(guard: Box<dyn Block>, members: Vec<Box<dyn Block>>) -> Self {
-        BlockGroup {
-            guard,
-            members,
-            separator: col(" │ ", palette::DIM),
-        }
+        BlockGroup { guard, members }
     }
 }
 
@@ -329,7 +329,7 @@ impl Block for BlockGroup {
         let guard_out = self.guard.render(ctx)?;
         let mut parts = vec![guard_out];
         parts.extend(self.members.iter().filter_map(|b| b.render(ctx)));
-        Some(parts.join(&self.separator))
+        Some(parts.join(get_separator()))
     }
 }
 
@@ -779,30 +779,34 @@ fn git_diff_stat(cwd: &str) -> (i64, i64) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Block registry — maps string names to constructors
+// Block registry — maps string names to constructors (cached)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// A factory function that creates a Block.
 type BlockFactory = fn() -> Box<dyn Block>;
 
-/// Registry of all available blocks by name.
-fn block_registry() -> HashMap<&'static str, BlockFactory> {
-    let mut m: HashMap<&'static str, BlockFactory> = HashMap::new();
+/// Cached registry of all available blocks by name.
+static BLOCK_REGISTRY: OnceLock<HashMap<&'static str, BlockFactory>> = OnceLock::new();
 
-    m.insert("model", || Box::new(ModelBlock));
-    m.insert("context_bar", || Box::new(ContextBarBlock::default()));
-    m.insert("cost", || Box::new(CostBlock));
-    m.insert("session_usage", || Box::new(SessionUsageBlock));
-    m.insert("session_reset", || Box::new(SessionResetBlock));
-    m.insert("daily_spend", || Box::new(DailySpendBlock));
-    m.insert("burn_rate", || Box::new(BurnRateBlock::default()));
-    m.insert("extra_credits", || Box::new(ExtraCreditsBlock));
-    m.insert("tokens", || Box::new(TokenCountBlock));
-    m.insert("duration", || Box::new(DurationBlock));
-    m.insert("git_diff", || Box::new(GitDiffBlock));
-    m.insert("dir", || Box::new(DirBlock));
+fn block_registry() -> &'static HashMap<&'static str, BlockFactory> {
+    BLOCK_REGISTRY.get_or_init(|| {
+        let mut m: HashMap<&'static str, BlockFactory> = HashMap::new();
 
-    m
+        m.insert("model", || Box::new(ModelBlock));
+        m.insert("context_bar", || Box::new(ContextBarBlock::default()));
+        m.insert("cost", || Box::new(CostBlock));
+        m.insert("session_usage", || Box::new(SessionUsageBlock));
+        m.insert("session_reset", || Box::new(SessionResetBlock));
+        m.insert("daily_spend", || Box::new(DailySpendBlock));
+        m.insert("burn_rate", || Box::new(BurnRateBlock::default()));
+        m.insert("extra_credits", || Box::new(ExtraCreditsBlock));
+        m.insert("tokens", || Box::new(TokenCountBlock));
+        m.insert("duration", || Box::new(DurationBlock));
+        m.insert("git_diff", || Box::new(GitDiffBlock));
+        m.insert("dir", || Box::new(DirBlock));
+
+        m
+    })
 }
 
 /// Create a block by name. Returns None if name is unknown.
@@ -823,7 +827,7 @@ enum BlockSpec {
     Group { guard: String, members: Vec<String> },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct LayoutConfig {
     /// Each row is a list of block specs.
     rows: Vec<Vec<BlockSpec>>,
@@ -861,11 +865,35 @@ fn config_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude/statusline_layout.json"))
 }
 
+/// Cached config with expiration (5 seconds).
+static CONFIG_CACHE: OnceLock<(LayoutConfig, Instant)> = OnceLock::new();
+const CONFIG_TTL_SECS: u64 = 5;
+
 fn load_config() -> LayoutConfig {
-    config_path()
+    let now = Instant::now();
+
+    // Check if we have a fresh cache
+    if let Some((config, ts)) = CONFIG_CACHE.get() {
+        if now.duration_since(*ts).as_secs() < CONFIG_TTL_SECS {
+            return config.clone();
+        }
+    }
+
+    // Load from file
+    let config: LayoutConfig = config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .and_then(|s| {
+            let result: Result<LayoutConfig, _> = serde_json::from_str(&s);
+            if let Err(ref e) = result {
+                debug_log(&format!("config parse error: {e}"));
+            }
+            result.ok()
+        })
+        .unwrap_or_default();
+
+    // Update cache (only once, subsequent calls use the cached value)
+    let _ = CONFIG_CACHE.get_or_init(|| (config.clone(), now));
+    config
 }
 
 /// Build a Row from a list of BlockSpecs.
