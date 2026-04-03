@@ -1,10 +1,10 @@
-use chrono::{DateTime, Utc};
+use chrono::{NaiveDateTime, TimeZone, Utc};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write;
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── Catppuccin Mocha palette ─────────────────────────────────────────────────
 mod palette {
@@ -24,19 +24,25 @@ mod palette {
 
 // ─── Color helpers ────────────────────────────────────────────────────────────
 
-fn col(s: &str, (r, g, b): (u8, u8, u8)) -> String {
-    format!("{}", s.truecolor(r, g, b))
+/// Write colored string to buffer, avoiding intermediate allocations.
+fn col_to(buf: &mut String, s: &str, (r, g, b): (u8, u8, u8)) {
+    write!(buf, "{}", s.truecolor(r, g, b)).unwrap();
 }
 
-fn col_bold(s: &str, (r, g, b): (u8, u8, u8)) -> String {
-    format!("{}", s.truecolor(r, g, b).bold())
+/// Write bold colored string to buffer.
+fn col_bold_to(buf: &mut String, s: &str, (r, g, b): (u8, u8, u8)) {
+    write!(buf, "{}", s.truecolor(r, g, b).bold()).unwrap();
+}
+
+/// Convenience: returns colored string (for simple cases where buffer isn't worth it).
+fn col(s: &str, rgb: (u8, u8, u8)) -> String {
+    format!("{}", s.truecolor(rgb.0, rgb.1, rgb.2))
 }
 
 // ─── Progress bar ─────────────────────────────────────────────────────────────
 
 fn make_bar(used_pct: u32, width: usize) -> String {
     let filled = ((used_pct as usize) * width) / 100;
-    let empty = width - filled;
 
     let fg = if used_pct < 50 {
         palette::BAR_GREEN
@@ -49,36 +55,51 @@ fn make_bar(used_pct: u32, width: usize) -> String {
     let (br, bg, bb) = palette::BAR_BG;
     let (dr, dg, db) = palette::DIM;
 
-    let filled_str = "█"
-        .repeat(filled)
-        .truecolor(fg.0, fg.1, fg.2)
-        .on_truecolor(br, bg, bb)
-        .to_string();
-
-    let empty_str = "░"
-        .repeat(empty)
-        .truecolor(dr, dg, db)
-        .on_truecolor(br, bg, bb)
-        .to_string();
-
-    format!("{filled_str}{empty_str}")
+    // Pre-allocate: each char needs ~9 ANSI codes + 1 char
+    let mut s = String::with_capacity(width * 12);
+    for _ in 0..filled {
+        write!(
+            s,
+            "{}",
+            "█".truecolor(fg.0, fg.1, fg.2).on_truecolor(br, bg, bb)
+        )
+        .unwrap();
+    }
+    for _ in 0..(width - filled) {
+        write!(
+            s,
+            "{}",
+            "░".truecolor(dr, dg, db).on_truecolor(br, bg, bb)
+        )
+        .unwrap();
+    }
+    s
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 fn now_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    Utc::now().timestamp() as u64
 }
 
 fn iso_to_epoch(s: &str) -> Option<u64> {
-    let trimmed = s.split('.').next().unwrap_or(s).trim_end_matches('Z');
-    format!("{trimmed}Z")
-        .parse::<DateTime<Utc>>()
+    // Handle ISO format with optional fractional seconds
+    let s = s.trim_end_matches('Z');
+    let s = if s.contains('.') {
+        // Truncate fractional seconds to 3 digits for chrono
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() == 2 {
+            let frac = parts[1].chars().take(3).collect::<String>();
+            format!("{}.{}Z", parts[0], frac)
+        } else {
+            format!("{}Z", s)
+        }
+    } else {
+        format!("{}Z", s)
+    };
+    NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.fZ")
         .ok()
-        .map(|dt| dt.timestamp() as u64)
+        .map(|dt| dt.and_utc().timestamp() as u64)
 }
 
 fn fmt_duration_ms(ms: u64) -> String {
@@ -94,9 +115,21 @@ fn fmt_duration_ms(ms: u64) -> String {
 
 fn fmt_token(n: u64) -> String {
     if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        // Integer math: divide by 100000 to get tenths of millions
+        let tenths = n / 100_000;
+        let whole = tenths / 10;
+        let frac = tenths % 10;
+        format!("{whole}.{frac}M")
     } else if n >= 1_000 {
-        format!("{:.0}k", n as f64 / 1_000.0)
+        // Integer math: divide by 100 to get tenths of thousands
+        let tenths = n / 100;
+        let whole = tenths / 10;
+        let frac = tenths % 10;
+        if frac == 0 {
+            format!("{whole}k")
+        } else {
+            format!("{whole}.{frac}k")
+        }
     } else {
         n.to_string()
     }
@@ -258,14 +291,6 @@ impl Row {
         }
     }
 
-    /// Row with a custom separator string.
-    fn with_sep(blocks: Vec<Box<dyn Block>>, separator: impl Into<String>) -> Self {
-        Row {
-            blocks,
-            separator: separator.into(),
-        }
-    }
-
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
         let parts: Vec<String> = self.blocks.iter().filter_map(|b| b.render(ctx)).collect();
         if parts.is_empty() {
@@ -330,7 +355,9 @@ impl Block for ModelBlock {
         if name.is_empty() {
             return None;
         }
-        Some(col_bold(name, palette::CYAN))
+        let mut s = String::with_capacity(name.len() + 20);
+        col_bold_to(&mut s, name, palette::CYAN);
+        Some(s)
     }
 }
 
@@ -350,8 +377,11 @@ impl Block for ContextBarBlock {
         let used_pct = cw.used_percentage.unwrap_or(0);
         let size_k = cw.context_window_size / 1000;
         let bar = make_bar(used_pct, self.width);
-        let label = col(&format!("{used_pct}%/{size_k}k"), palette::WHITE);
-        Some(format!("{bar} {label}"))
+        let mut s = String::with_capacity(bar.len() + 20);
+        s.push_str(&bar);
+        s.push(' ');
+        col_to(&mut s, &format!("{used_pct}%/{size_k}k"), palette::WHITE);
+        Some(s)
     }
 }
 
@@ -360,7 +390,9 @@ struct CostBlock;
 impl Block for CostBlock {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
         let cost = ctx.input.cost.total_cost_usd;
-        Some(col_bold(&format!("${cost:.2}"), palette::YELLOW))
+        let mut s = String::with_capacity(16);
+        col_bold_to(&mut s, &format!("${cost:.2}"), palette::YELLOW);
+        Some(s)
     }
 }
 
@@ -385,8 +417,8 @@ impl Block for SessionResetBlock {
         }
         let m = reset_secs / 60;
         let reset_epoch = now_epoch() + reset_secs;
-        let dt = DateTime::<Utc>::from_timestamp(reset_epoch as i64, 0).unwrap_or_default();
-        let hhmm = format!("{:02}:{:02}", dt.format("%H"), dt.format("%M"));
+        let dt = Utc.timestamp_opt(reset_epoch as i64, 0).single().unwrap_or_default();
+        let hhmm = dt.format("%H:%M").to_string();
         Some(col(&format!("{m}m→{hhmm}"), palette::GRAY))
     }
 }
@@ -460,13 +492,12 @@ impl Block for TokenCountBlock {
         let usage = ctx.input.context_window.current_usage.as_ref()?;
         let i = usage.input_tokens?;
         let o = usage.output_tokens?;
-        Some(format!(
-            "{}{}{}{}",
-            col("i:", palette::GRAY),
-            col(&fmt_token(i), palette::WHITE),
-            col("/o:", palette::GRAY),
-            col(&fmt_token(o), palette::WHITE),
-        ))
+        let mut s = String::with_capacity(32);
+        col_to(&mut s, "i:", palette::GRAY);
+        col_to(&mut s, &fmt_token(i), palette::WHITE);
+        col_to(&mut s, "/o:", palette::GRAY);
+        col_to(&mut s, &fmt_token(o), palette::WHITE);
+        Some(s)
     }
 }
 
@@ -488,11 +519,11 @@ struct GitDiffBlock;
 impl Block for GitDiffBlock {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
         let (add, del) = ctx.derived.git_diff;
-        Some(format!(
-            "{}/{}",
-            col(&format!("+{add}"), palette::GREEN),
-            col(&format!("-{del}"), palette::RED),
-        ))
+        let mut s = String::with_capacity(20);
+        col_to(&mut s, &format!("+{add}"), palette::GREEN);
+        s.push('/');
+        col_to(&mut s, &format!("-{del}"), palette::RED);
+        Some(s)
     }
 }
 
@@ -501,17 +532,13 @@ impl Block for GitDiffBlock {
 struct DirBlock;
 impl Block for DirBlock {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
-        let branch = ctx
-            .derived
-            .git_branch
-            .as_deref()
-            .map(|b| format!(" {}", col(&format!("({b})"), palette::GRAY)))
-            .unwrap_or_default();
-        Some(format!(
-            "{}{}",
-            col(&ctx.derived.dir_name, palette::WHITE),
-            branch
-        ))
+        let mut s = String::with_capacity(64);
+        col_to(&mut s, &ctx.derived.dir_name, palette::WHITE);
+        if let Some(b) = ctx.derived.git_branch.as_deref() {
+            s.push(' ');
+            col_to(&mut s, &format!("({b})"), palette::GRAY);
+        }
+        Some(s)
     }
 }
 
