@@ -1,12 +1,10 @@
-# claude-statusline (Rust) — 4-line statusbar
+# claude-statusline (Rust) — Configurable statusbar
 
-Matches the layout from the screenshot:
+A fast, configurable status line for Claude Code with minimal allocations and LTO-optimized binary.
 
 ```
-Opus 4.6 · Max  [██████░░░░]  0%/200k  │  #3/35 $1.40
-~27%  │  28m→02:00  │  $9.6/$1.4D  │  ● $2.6/h
-$0.00  │  i:0/o:0  │  9m49s  │  +0/-0  │  myproject (main)
-Effort set to high for this turn
+Opus 4.6  [██████░░░░] 27%/200k  │  $1.40
+i:5k/o:340  │  9m49s  │  +5/-2  │  project
 ```
 
 ## Build
@@ -16,7 +14,11 @@ cargo build --release
 cp target/release/claude-statusline ~/.local/bin/
 ```
 
+Binary is ~1.8MB (LTO + stripped).
+
 ## Configure
+
+### Claude Code integration
 
 `~/.claude/settings.json`:
 ```json
@@ -28,35 +30,67 @@ cp target/release/claude-statusline ~/.local/bin/
 }
 ```
 
+### Layout customization
+
+`~/.claude/statusline_layout.json`:
+```json
+{
+  "rows": [
+    ["model", "context_bar", "cost"],
+    [{"guard": "session_usage", "members": ["session_reset", "burn_rate"]}],
+    ["tokens", "duration", "git_diff", "dir"]
+  ]
+}
+```
+
+**Available blocks:**
+
+| Block | Content |
+|-------|---------|
+| `model` | Model name (Opus 4.6) |
+| `context_bar` | Progress bar + percentage |
+| `cost` | Session cost ($1.40) |
+| `session_usage` | 5-hour usage % (guard) |
+| `session_reset` | Reset countdown |
+| `daily_spend` | Daily spend/average |
+| `burn_rate` | Cost per hour |
+| `extra_credits` | Extra credits used |
+| `tokens` | i/o token counts |
+| `duration` | Session duration |
+| `git_diff` | +/- lines |
+| `dir` | Directory + branch |
+
+**Conditional groups:** `{"guard": "X", "members": ["A", "B"]}` — members only show when guard has data.
+
 ## Test without Claude Code
 
 ```bash
 echo '{
-  "model": {"display_name": "Opus 4.6", "id": "claude-opus-4-6"},
+  "model": {"display_name": "Opus 4.6"},
   "workspace": {"current_dir": "/Users/me/myproject"},
   "context_window": {
     "used_percentage": 27,
-    "remaining_percentage": 73,
     "context_window_size": 200000,
-    "current_usage": {"input_tokens": 0, "output_tokens": 0}
+    "current_usage": {"input_tokens": 5000, "output_tokens": 340}
   },
-  "cost": {"total_cost_usd": 1.40, "total_lines_added": 0, "total_lines_removed": 0},
-  "session": {"turns": 3, "total_turns": 35, "duration_ms": 589000, "thinking_effort": "high"}
+  "cost": {"total_cost_usd": 1.40, "total_duration_ms": 589000, "total_lines_added": 5, "total_lines_removed": 2}
 }' | ./target/release/claude-statusline
 ```
 
-## Lines breakdown
+Enable debug: `STATUSLINE_DEBUG=1` logs to `~/.claude/statusline_debug.log`.
 
-| Line | Content |
-|------|---------|
-| 1 | Model name · context bar · ctx%/size · turn counter · session cost |
-| 2 | 5h usage% · reset countdown · daily spend · $/h rate |
-| 3 | Extra credits · i/o tokens · duration · git +/- · dir(branch) |
-| 4 | Thinking effort hint (only shown when set) |
+## Performance
+
+- LTO + `opt-level="z"` for small binary
+- Buffer-based string building (avoid intermediate allocations)
+- Integer math for token formatting
+- Background cache refresh (non-blocking HTTP)
+- Single-pass git info extraction
 
 ## Dependencies
 
 - `serde` + `serde_json` — JSON parsing
-- `chrono` — ISO timestamp → epoch
-- `ureq 3` — Usage API HTTP call
-- `dirs` — cross-platform home dir
+- `chrono` — Timestamp handling
+- `ureq 3` — HTTP client (sync, lightweight)
+- `dirs` — Cross-platform home dir
+- `owo-colors` — True-color terminal output

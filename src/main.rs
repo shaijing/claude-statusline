@@ -1,6 +1,7 @@
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::io::Read;
 use std::path::Path;
@@ -778,6 +779,137 @@ fn git_diff_stat(cwd: &str) -> (i64, i64) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Block registry — maps string names to constructors
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A factory function that creates a Block.
+type BlockFactory = fn() -> Box<dyn Block>;
+
+/// Registry of all available blocks by name.
+fn block_registry() -> HashMap<&'static str, BlockFactory> {
+    let mut m: HashMap<&'static str, BlockFactory> = HashMap::new();
+
+    m.insert("model", || Box::new(ModelBlock));
+    m.insert("context_bar", || Box::new(ContextBarBlock::default()));
+    m.insert("cost", || Box::new(CostBlock));
+    m.insert("session_usage", || Box::new(SessionUsageBlock));
+    m.insert("session_reset", || Box::new(SessionResetBlock));
+    m.insert("daily_spend", || Box::new(DailySpendBlock));
+    m.insert("burn_rate", || Box::new(BurnRateBlock::default()));
+    m.insert("extra_credits", || Box::new(ExtraCreditsBlock));
+    m.insert("tokens", || Box::new(TokenCountBlock));
+    m.insert("duration", || Box::new(DurationBlock));
+    m.insert("git_diff", || Box::new(GitDiffBlock));
+    m.insert("dir", || Box::new(DirBlock));
+
+    m
+}
+
+/// Create a block by name. Returns None if name is unknown.
+fn make_block(name: &str) -> Option<Box<dyn Block>> {
+    block_registry().get(name).map(|f| f())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Layout configuration
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum BlockSpec {
+    /// Simple block by name: "model"
+    Simple(String),
+    /// Group with guard: {"guard": "session_usage", "members": ["reset", "spend"]}
+    Group { guard: String, members: Vec<String> },
+}
+
+#[derive(Debug, Deserialize)]
+struct LayoutConfig {
+    /// Each row is a list of block specs.
+    rows: Vec<Vec<BlockSpec>>,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        LayoutConfig {
+            rows: vec![
+                // Row 1: model · context bar · cost
+                vec![
+                    BlockSpec::Simple("model".into()),
+                    BlockSpec::Simple("context_bar".into()),
+                    BlockSpec::Simple("cost".into()),
+                ],
+                // Row 2: session group
+                vec![BlockSpec::Group {
+                    guard: "session_usage".into(),
+                    members: vec!["session_reset".into(), "daily_spend".into(), "burn_rate".into()],
+                }],
+                // Row 3: extra credits · tokens · duration · git diff · dir
+                vec![
+                    BlockSpec::Simple("extra_credits".into()),
+                    BlockSpec::Simple("tokens".into()),
+                    BlockSpec::Simple("duration".into()),
+                    BlockSpec::Simple("git_diff".into()),
+                    BlockSpec::Simple("dir".into()),
+                ],
+            ],
+        }
+    }
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude/statusline_layout.json"))
+}
+
+fn load_config() -> LayoutConfig {
+    config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Build a Row from a list of BlockSpecs.
+fn build_row(specs: Vec<BlockSpec>) -> Option<Row> {
+    let mut blocks: Vec<Box<dyn Block>> = Vec::new();
+
+    for spec in specs {
+        match spec {
+            BlockSpec::Simple(name) => {
+                if let Some(b) = make_block(&name) {
+                    blocks.push(b);
+                } else {
+                    debug_log(&format!("unknown block: {name}"));
+                }
+            }
+            BlockSpec::Group { guard, members } => {
+                let guard_block = make_block(&guard)?;
+                let member_blocks: Vec<Box<dyn Block>> = members
+                    .iter()
+                    .filter_map(|m| make_block(m))
+                    .collect();
+                blocks.push(Box::new(BlockGroup::new(guard_block, member_blocks)));
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(Row::new(blocks))
+    }
+}
+
+/// Build Layout from config.
+fn build_layout(config: &LayoutConfig) -> Layout {
+    let rows: Vec<Row> = config
+        .rows
+        .iter()
+        .filter_map(|specs| build_row(specs.clone()))
+        .collect();
+    Layout(rows)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -802,41 +934,9 @@ fn main() {
         derived: &derived,
     };
 
-    // ── Layout ───────────────────────────────────────────────────────────────
-    //
-    // Adding a block:  implement Block, drop it into the row you want.
-    // Reordering:      move it within the vec.
-    // Removing:        delete the line.
-    // Custom separator: Row::with_sep(blocks, "  ") instead of Row::new(blocks).
-    // Conditional group: BlockGroup::new(guard, members) — members only render
-    //                    when guard returns Some.
-    //
-    let layout = Layout(vec![
-        // Row 1: model · context bar · cost
-        Row::new(vec![
-            Box::new(ModelBlock),
-            Box::new(ContextBarBlock::default()),
-            Box::new(CostBlock),
-        ]),
-        // Row 2: session usage (guard) + reset/spend/rate as a group.
-        // If session data is absent the whole row is suppressed.
-        Row::new(vec![Box::new(BlockGroup::new(
-            Box::new(SessionUsageBlock),
-            vec![
-                Box::new(SessionResetBlock),
-                Box::new(DailySpendBlock),
-                Box::new(BurnRateBlock::default()),
-            ],
-        ))]),
-        // Row 3: extra credits · tokens · duration · git diff · dir
-        Row::new(vec![
-            Box::new(ExtraCreditsBlock),
-            Box::new(TokenCountBlock),
-            Box::new(DurationBlock),
-            Box::new(GitDiffBlock),
-            Box::new(DirBlock),
-        ]),
-    ]);
+    // Load layout config (or use default). Config is cached per session.
+    let config = load_config();
+    let layout = build_layout(&config);
 
     layout.print(&ctx);
 }
