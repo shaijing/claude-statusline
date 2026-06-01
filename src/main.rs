@@ -3,10 +3,10 @@ use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::io::Read;
+use std::io::{Read, Write as _};
 use std::path::Path;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 // ─── Catppuccin Mocha palette ─────────────────────────────────────────────────
@@ -28,24 +28,35 @@ mod palette {
 // ─── Color helpers ────────────────────────────────────────────────────────────
 
 /// Write colored string to buffer, avoiding intermediate allocations.
-fn col_to(buf: &mut String, s: &str, (r, g, b): (u8, u8, u8)) {
-    write!(buf, "{}", s.truecolor(r, g, b)).unwrap();
+/// Accepts any `Display` — pass `&str`, `String`, or `format_args!(...)`.
+fn col_to(buf: &mut String, s: impl std::fmt::Display, (r, g, b): (u8, u8, u8)) {
+    let _ = write!(buf, "{}", s.truecolor(r, g, b));
 }
 
 /// Write bold colored string to buffer.
-fn col_bold_to(buf: &mut String, s: &str, (r, g, b): (u8, u8, u8)) {
-    write!(buf, "{}", s.truecolor(r, g, b).bold()).unwrap();
+fn col_bold_to(buf: &mut String, s: impl std::fmt::Display, (r, g, b): (u8, u8, u8)) {
+    let _ = write!(buf, "{}", s.truecolor(r, g, b).bold());
 }
 
 /// Convenience: returns colored string (for simple cases where buffer isn't worth it).
-fn col(s: &str, rgb: (u8, u8, u8)) -> String {
+fn col(s: impl std::fmt::Display, rgb: (u8, u8, u8)) -> String {
     format!("{}", s.truecolor(rgb.0, rgb.1, rgb.2))
 }
 
 // ─── Progress bar ─────────────────────────────────────────────────────────────
 
+/// Build the context-window progress bar.
+///
+/// Hand-rolled ANSI to avoid per-character owo-colors Display allocations:
+/// one combined SGR escape per color group, one reset at the end.
+/// Output is byte-identical to the previous owo-colors version.
 fn make_bar(used_pct: u32, width: usize) -> String {
-    let filled = ((used_pct as usize) * width) / 100;
+    if width == 0 {
+        return String::new();
+    }
+    let pct = used_pct.min(100);
+    let filled = (pct as usize * width) / 100;
+    let empty = width - filled;
 
     let fg = if used_pct < 50 {
         palette::BAR_GREEN
@@ -58,24 +69,28 @@ fn make_bar(used_pct: u32, width: usize) -> String {
     let (br, bg, bb) = palette::BAR_BG;
     let (dr, dg, db) = palette::DIM;
 
-    // Pre-allocate: each char needs ~9 ANSI codes + 1 char
-    let mut s = String::with_capacity(width * 12);
+    // Pre-size: 2 ANSI sequences (~22 bytes) + 1 reset (~6 bytes) + width chars.
+    let mut s = String::with_capacity(width + 32);
+    let _ = write!(
+        s,
+        "\x1b[38;2;{};{};{};48;2;{};{};{}m",
+        fg.0, fg.1, fg.2, br, bg, bb
+    );
     for _ in 0..filled {
-        write!(
-            s,
-            "{}",
-            "█".truecolor(fg.0, fg.1, fg.2).on_truecolor(br, bg, bb)
-        )
-        .unwrap();
+        s.push('█');
     }
-    for _ in 0..(width - filled) {
-        write!(
+    if empty > 0 {
+        s.push_str("\x1b[39;49m");
+        let _ = write!(
             s,
-            "{}",
-            "░".truecolor(dr, dg, db).on_truecolor(br, bg, bb)
-        )
-        .unwrap();
+            "\x1b[38;2;{};{};{};48;2;{};{};{}m",
+            dr, dg, db, br, bg, bb
+        );
+        for _ in 0..empty {
+            s.push('░');
+        }
     }
+    s.push_str("\x1b[39;49m");
     s
 }
 
@@ -153,7 +168,6 @@ fn debug_log(msg: &str) {
     }
     if let Some(path) = dirs::home_dir().map(|h| h.join(".claude/statusline_debug.log")) {
         let line = format!("[{}] {}\n", now_epoch(), msg);
-        use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -297,13 +311,21 @@ impl Row {
         Row { blocks }
     }
 
+    /// Render into a single buffer, skipping blocks that return `None`.
+    /// No intermediate `Vec<String>` or `join` allocation.
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
-        let parts: Vec<String> = self.blocks.iter().filter_map(|b| b.render(ctx)).collect();
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(get_separator()))
+        let mut buf = String::new();
+        let mut first = true;
+        for b in &self.blocks {
+            if let Some(s) = b.render(ctx) {
+                if !first {
+                    buf.push_str(get_separator());
+                }
+                buf.push_str(&s);
+                first = false;
+            }
         }
+        if buf.is_empty() { None } else { Some(buf) }
     }
 }
 
@@ -327,9 +349,15 @@ impl Block for BlockGroup {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
         // Guard must produce output; if not, the whole group is suppressed.
         let guard_out = self.guard.render(ctx)?;
-        let mut parts = vec![guard_out];
-        parts.extend(self.members.iter().filter_map(|b| b.render(ctx)));
-        Some(parts.join(get_separator()))
+        let mut buf = String::with_capacity(guard_out.len() + 32);
+        buf.push_str(&guard_out);
+        for b in &self.members {
+            if let Some(s) = b.render(ctx) {
+                buf.push_str(get_separator());
+                buf.push_str(&s);
+            }
+        }
+        Some(buf)
     }
 }
 
@@ -338,9 +366,20 @@ impl Block for BlockGroup {
 struct Layout(Vec<Row>);
 
 impl Layout {
+    /// Print all non-empty rows joined by newlines, in a single buffer.
     fn print(&self, ctx: &RenderCtx) {
-        let lines: Vec<String> = self.0.iter().filter_map(|row| row.render(ctx)).collect();
-        println!("{}", lines.join("\n"));
+        let mut buf = String::new();
+        let mut first = true;
+        for row in &self.0 {
+            if let Some(line) = row.render(ctx) {
+                if !first {
+                    buf.push('\n');
+                }
+                buf.push_str(&line);
+                first = false;
+            }
+        }
+        println!("{buf}");
     }
 }
 
@@ -381,7 +420,7 @@ impl Block for ContextBarBlock {
         let mut s = String::with_capacity(bar.len() + 20);
         s.push_str(&bar);
         s.push(' ');
-        col_to(&mut s, &format!("{used_pct}%/{size_k}k"), palette::WHITE);
+        col_to(&mut s, format_args!("{used_pct}%/{size_k}k"), palette::WHITE);
         Some(s)
     }
 }
@@ -392,7 +431,7 @@ impl Block for CostBlock {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
         let cost = ctx.input.cost.total_cost_usd;
         let mut s = String::with_capacity(16);
-        col_bold_to(&mut s, &format!("${cost:.2}"), palette::YELLOW);
+        col_bold_to(&mut s, format_args!("${cost:.2}"), palette::YELLOW);
         Some(s)
     }
 }
@@ -404,7 +443,7 @@ struct SessionUsageBlock;
 impl Block for SessionUsageBlock {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
         let pct = ctx.cache.session_pct?;
-        Some(col(&format!("~{pct}%"), usage_color(pct)))
+        Some(col(format_args!("~{pct}%"), usage_color(pct)))
     }
 }
 
@@ -420,7 +459,7 @@ impl Block for SessionResetBlock {
         let reset_epoch = now_epoch() + reset_secs;
         let dt = Utc.timestamp_opt(reset_epoch as i64, 0).single().unwrap_or_default();
         let hhmm = dt.format("%H:%M").to_string();
-        Some(col(&format!("{m}m→{hhmm}"), palette::GRAY))
+        Some(col(format_args!("{m}m→{hhmm}"), palette::GRAY))
     }
 }
 
@@ -435,7 +474,7 @@ impl Block for DailySpendBlock {
         }
         let spent = used_c / 100.0;
         let daily_avg = spent / 30.0;
-        Some(col(&format!("${spent:.1}/${daily_avg:.1}D"), palette::GRAY))
+        Some(col(format_args!("${spent:.1}/${daily_avg:.1}D"), palette::GRAY))
     }
 }
 
@@ -482,7 +521,7 @@ impl Block for ExtraCreditsBlock {
         } else {
             palette::GRAY
         };
-        Some(col(&format!("${spent:.2}"), color))
+        Some(col(format_args!("${spent:.2}"), color))
     }
 }
 
@@ -495,9 +534,9 @@ impl Block for TokenCountBlock {
         let o = usage.output_tokens?;
         let mut s = String::with_capacity(32);
         col_to(&mut s, "i:", palette::GRAY);
-        col_to(&mut s, &fmt_token(i), palette::WHITE);
+        col_to(&mut s, fmt_token(i), palette::WHITE);
         col_to(&mut s, "/o:", palette::GRAY);
-        col_to(&mut s, &fmt_token(o), palette::WHITE);
+        col_to(&mut s, fmt_token(o), palette::WHITE);
         Some(s)
     }
 }
@@ -510,7 +549,7 @@ impl Block for DurationBlock {
         if ms == 0 {
             return None;
         }
-        Some(col(&fmt_duration_ms(ms), palette::GRAY))
+        Some(col(fmt_duration_ms(ms), palette::GRAY))
     }
 }
 
@@ -521,9 +560,9 @@ impl Block for GitDiffBlock {
     fn render(&self, ctx: &RenderCtx) -> Option<String> {
         let (add, del) = ctx.derived.git_diff;
         let mut s = String::with_capacity(20);
-        col_to(&mut s, &format!("+{add}"), palette::GREEN);
+        col_to(&mut s, format_args!("+{add}"), palette::GREEN);
         s.push('/');
-        col_to(&mut s, &format!("-{del}"), palette::RED);
+        col_to(&mut s, format_args!("-{del}"), palette::RED);
         Some(s)
     }
 }
@@ -537,7 +576,7 @@ impl Block for DirBlock {
         col_to(&mut s, &ctx.derived.dir_name, palette::WHITE);
         if let Some(b) = ctx.derived.git_branch.as_deref() {
             s.push(' ');
-            col_to(&mut s, &format!("({b})"), palette::GRAY);
+            col_to(&mut s, format_args!("({b})"), palette::GRAY);
         }
         Some(s)
     }
@@ -552,8 +591,6 @@ struct Cache {
     timestamp: u64,
     session_pct: Option<u32>,
     session_reset_secs: Option<u64>,
-    weekly_pct: Option<u32>,
-    weekly_reset_secs: Option<u64>,
     extra_used_cents: Option<f64>,
     extra_limit_cents: Option<f64>,
 }
@@ -561,7 +598,6 @@ struct Cache {
 #[derive(Debug, Deserialize)]
 struct UsageResponse {
     five_hour: Option<UsagePeriod>,
-    seven_day: Option<UsagePeriod>,
     extra_usage: Option<ExtraUsage>,
 }
 
@@ -718,14 +754,6 @@ fn fetch_and_save_cache() {
             .and_then(iso_to_epoch)
             .map(|e| e.saturating_sub(now));
     }
-    if let Some(sd) = &usage.seven_day {
-        cache.weekly_pct = sd.utilization.map(|u| u as u32);
-        cache.weekly_reset_secs = sd
-            .resets_at
-            .as_deref()
-            .and_then(iso_to_epoch)
-            .map(|e| e.saturating_sub(now));
-    }
     if let Some(ex) = &usage.extra_usage {
         cache.extra_used_cents = ex.used_credits;
         cache.extra_limit_cents = ex.monthly_limit;
@@ -866,20 +894,23 @@ fn config_path() -> Option<std::path::PathBuf> {
 }
 
 /// Cached config with expiration (5 seconds).
-static CONFIG_CACHE: OnceLock<(LayoutConfig, Instant)> = OnceLock::new();
+///
+/// `OnceLock` cannot model "expire and refresh", so use a Mutex<Option<…>>.
+/// This is a single-threaded CLI in practice; the lock never contends.
+static CONFIG_CACHE: Mutex<Option<(LayoutConfig, Instant)>> = Mutex::new(None);
 const CONFIG_TTL_SECS: u64 = 5;
 
 fn load_config() -> LayoutConfig {
     let now = Instant::now();
 
-    // Check if we have a fresh cache
-    if let Some((config, ts)) = CONFIG_CACHE.get() {
-        if now.duration_since(*ts).as_secs() < CONFIG_TTL_SECS {
-            return config.clone();
-        }
+    // Fast path: cache hit and still fresh.
+    if let Some((config, ts)) = CONFIG_CACHE.lock().unwrap().as_ref()
+        && now.duration_since(*ts).as_secs() < CONFIG_TTL_SECS
+    {
+        return config.clone();
     }
 
-    // Load from file
+    // Slow path: re-read from disk.
     let config: LayoutConfig = config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| {
@@ -891,8 +922,7 @@ fn load_config() -> LayoutConfig {
         })
         .unwrap_or_default();
 
-    // Update cache (only once, subsequent calls use the cached value)
-    let _ = CONFIG_CACHE.get_or_init(|| (config.clone(), now));
+    *CONFIG_CACHE.lock().unwrap() = Some((config.clone(), now));
     config
 }
 
